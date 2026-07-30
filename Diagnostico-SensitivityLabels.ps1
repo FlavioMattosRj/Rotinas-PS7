@@ -104,33 +104,15 @@ function Assert-SPOModule {
 function Connect-AoSPO {
     Write-Section "Conexão ao SharePoint Online"
 
-    Write-Host @"
+    $tenantNome = (Read-Host "`n  Nome do tenant (ex: contoso)").Trim().ToLower()
+    $adminUrl   = "https://$tenantNome-admin.sharepoint.com"
 
-  Informe a URL do SharePoint Admin do seu tenant.
-  Formato esperado: https://NOME_TENANT-admin.sharepoint.com
-
-"@ -ForegroundColor Gray
-
-    $urlValida = $false
-    $adminUrl  = ''
-
-    while (-not $urlValida) {
-        $adminUrl = (Read-Host '  URL Admin').Trim().TrimEnd('/')
-
-        if ($adminUrl -match '^https://[a-zA-Z0-9][a-zA-Z0-9\-]*-admin\.sharepoint\.com$') {
-            $urlValida = $true
-        }
-        else {
-            Write-Fail "Formato inválido. Use: https://TENANT-admin.sharepoint.com"
-        }
-    }
-
-    Write-Host ''
+    Write-Info "Conectando a: $adminUrl"
     Write-Info 'Abrindo autenticação moderna no browser (MFA habilitado)...'
 
     try {
         Connect-SPOService -Url $adminUrl -ErrorAction Stop
-        Write-Ok "Conectado a: $adminUrl"
+        Write-Ok "Conectado com sucesso."
         return $adminUrl
     }
     catch {
