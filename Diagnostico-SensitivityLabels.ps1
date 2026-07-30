@@ -9,8 +9,9 @@
     no nível de tenant e diagnostica sites individuais de forma interativa.
 
 .NOTES
-    Módulo  : Microsoft.Online.SharePoint.PowerShell
-    Permissão necessária: SharePoint Administrator
+    Módulos : Microsoft.Online.SharePoint.PowerShell
+              ExchangeOnlineManagement (para listar labels via Purview)
+    Permissão necessária: SharePoint Administrator + Compliance Administrator
     Autenticação: Moderna (MFA via browser)
 #>
 
@@ -97,6 +98,40 @@ function Assert-SPOModule {
     }
 }
 
+function Assert-EXOModule {
+    $moduleName = 'ExchangeOnlineManagement'
+
+    $modInstalado = Get-Module -ListAvailable -Name $moduleName |
+                    Sort-Object Version -Descending |
+                    Select-Object -First 1
+
+    if (-not $modInstalado) {
+        Write-Warn "Módulo '$moduleName' não encontrado."
+        Write-Info  "Instalando no escopo do usuário atual..."
+        try {
+            Install-Module -Name $moduleName `
+                           -Scope CurrentUser `
+                           -Force `
+                           -AllowClobber `
+                           -Repository PSGallery `
+                           -ErrorAction Stop
+            $modInstalado = Get-Module -ListAvailable -Name $moduleName |
+                            Sort-Object Version -Descending |
+                            Select-Object -First 1
+            Write-Ok "Módulo instalado (versão $($modInstalado.Version))."
+        }
+        catch {
+            Write-Fail "Falha ao instalar o módulo: $_"
+            exit 1
+        }
+    }
+    else {
+        Write-Ok "Módulo '$moduleName' encontrado (versão $($modInstalado.Version))."
+    }
+
+    Import-Module $moduleName -ErrorAction Stop
+}
+
 # ─────────────────────────────────────────────────────────────────────────────
 # CONEXÃO AO SHAREPOINT ONLINE
 # ─────────────────────────────────────────────────────────────────────────────
@@ -119,6 +154,67 @@ function Connect-AoSPO {
         Write-Fail "Falha na conexão: $_"
         exit 1
     }
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CONEXÃO AO PURVIEW (COMPLIANCE) E LISTAGEM DE LABELS
+# ─────────────────────────────────────────────────────────────────────────────
+
+function Connect-AoPurview ([string]$TenantNome) {
+    Write-Section "Conexão ao Purview / Compliance (ExchangeOnlineManagement)"
+    Write-Info 'Conectando via Connect-IPPSSession (MFA habilitado)...'
+
+    try {
+        # UserPrincipalName é opcional; se omitido, o browser pede credenciais
+        Connect-IPPSSession -ShowBanner:$false -ErrorAction Stop
+        Write-Ok 'Conectado ao centro de Conformidade/Purview.'
+    }
+    catch {
+        Write-Fail "Falha na conexão ao Purview: $_"
+        exit 1
+    }
+}
+
+function Get-LabelsDoTenant {
+    Write-Section "Rótulos de Sensibilidade definidos no Tenant (Purview)"
+
+    try {
+        $labels = Get-Label -ErrorAction Stop
+    }
+    catch {
+        Write-Warn "Não foi possível listar os rótulos: $_"
+        return @{}
+    }
+
+    if ($labels.Count -eq 0) {
+        Write-Warn 'Nenhum rótulo de sensibilidade publicado encontrado no tenant.'
+        return @{}
+    }
+
+    # Monta hashtable GUID(lower) → DisplayName para uso na resolução de sites
+    $mapa = @{}
+
+    Write-Host ''
+    Write-Host "  {'Prioridade',-4}  {'Nome',-40}  {'Escopo'}" -ForegroundColor White
+    Write-Host "  $('-' * 4)  $('-' * 40)  $('-' * 30)" -ForegroundColor DarkGray
+
+    foreach ($label in ($labels | Sort-Object Priority)) {
+        $guid    = $label.ImmutableId.ToString().ToLower()
+        $nome    = $label.DisplayName
+        $escopo  = $label.ContentType -join ', '
+        $prioridade = $label.Priority
+
+        $mapa[$guid] = $nome
+
+        $cor = if ($label.IsActive) { 'Green' } else { 'DarkYellow' }
+        $inativo = if (-not $label.IsActive) { '  [inativo]' } else { '' }
+        Write-Host ("  {0,-6}  {1,-40}  {2}{3}" -f $prioridade, $nome, $escopo, $inativo) -ForegroundColor $cor
+    }
+
+    Write-Host ''
+    Write-Ok "$($labels.Count) rótulo(s) encontrado(s)."
+
+    return $mapa
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -165,7 +261,7 @@ function Test-TenantLabels {
 # DIAGNÓSTICO — SITE INDIVIDUAL
 # ─────────────────────────────────────────────────────────────────────────────
 
-function Get-SiteLabelInfo ([string]$SiteUrl) {
+function Get-SiteLabelInfo ([string]$SiteUrl, [hashtable]$LabelsMap = @{}) {
     try {
         $site = Get-SPOSite -Identity $SiteUrl -ErrorAction Stop
 
@@ -174,9 +270,14 @@ function Get-SiteLabelInfo ([string]$SiteUrl) {
         $semLabel  = [string]::IsNullOrWhiteSpace($labelGuid) -or
                      $labelGuid -eq '00000000-0000-0000-0000-000000000000'
 
-        # SensitivityLabelName pode não existir em versões mais antigas do módulo
+        # Resolve o nome: primeiro pelo mapa Purview (mais confiável), depois pela propriedade SPO
         $labelNome = $null
-        try { $labelNome = $site.SensitivityLabelName } catch { }
+        if (-not $semLabel) {
+            $labelNome = $LabelsMap[$labelGuid.ToString().ToLower()]
+        }
+        if (-not $labelNome) {
+            try { $labelNome = $site.SensitivityLabelName } catch { }
+        }
 
         return [PSCustomObject]@{
             Url       = $site.Url
@@ -232,7 +333,7 @@ function Show-SiteResult ([PSCustomObject]$Resultado) {
 # LOOP INTERATIVO DE SITES
 # ─────────────────────────────────────────────────────────────────────────────
 
-function Invoke-SiteLoop {
+function Invoke-SiteLoop ([hashtable]$LabelsMap = @{}) {
     Write-Section "Diagnóstico — Sites Individuais"
 
     Write-Host @"
@@ -260,7 +361,7 @@ function Invoke-SiteLoop {
             continue
         }
 
-        $resultado = Get-SiteLabelInfo -SiteUrl $entrada
+        $resultado = Get-SiteLabelInfo -SiteUrl $entrada -LabelsMap $LabelsMap
         Show-SiteResult -Resultado $resultado
         $resultados.Add($resultado)
     }
@@ -316,6 +417,7 @@ function Show-Resumo ([System.Collections.Generic.List[PSCustomObject]]$Resultad
 try {
     Write-Banner
     Assert-SPOModule
+    Assert-EXOModule
     Connect-AoSPO | Out-Null
 
     $tenantHabilitado = Test-TenantLabels
@@ -327,14 +429,18 @@ try {
         Write-Host ''
     }
     else {
-        $resultados = Invoke-SiteLoop
+        Connect-AoPurview
+        $labelsMap = Get-LabelsDoTenant
+
+        $resultados = Invoke-SiteLoop -LabelsMap $labelsMap
         Show-Resumo -Resultados $resultados
     }
 }
 finally {
     Write-Host ''
-    Write-Host '  Desconectando do SharePoint Online...' -ForegroundColor Gray
+    Write-Host '  Desconectando...' -ForegroundColor Gray
     Disconnect-SPOService -ErrorAction SilentlyContinue
+    Disconnect-ExchangeOnline -Confirm:$false -ErrorAction SilentlyContinue
     Write-Host '  Sessão encerrada.' -ForegroundColor Cyan
     Write-Host ''
 }
