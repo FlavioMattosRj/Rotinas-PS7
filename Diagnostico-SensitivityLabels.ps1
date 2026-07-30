@@ -10,9 +10,16 @@
 
 .NOTES
     Módulos : Microsoft.Online.SharePoint.PowerShell
-              ExchangeOnlineManagement (para listar labels via Purview)
-    Permissão necessária: SharePoint Administrator + Compliance Administrator
+              Microsoft.Graph.Authentication (para listar labels via Graph /beta)
+    Permissão necessária: SharePoint Administrator
+              Escopo Graph: InformationProtectionPolicy.Read (delegado)
     Autenticação: Moderna (MFA via browser)
+
+.NOTES
+    O endpoint de labels do Microsoft Graph usado aqui
+    (security/informationProtection/sensitivityLabels) ainda está em /beta
+    e sujeito a mudanças pela Microsoft. Em modo delegado só há consulta
+    via /me (não existe endpoint organizacional delegado).
 #>
 
 Set-StrictMode -Version Latest
@@ -98,8 +105,8 @@ function Assert-SPOModule {
     }
 }
 
-function Assert-EXOModule {
-    $moduleName = 'ExchangeOnlineManagement'
+function Assert-GraphModule {
+    $moduleName = 'Microsoft.Graph.Authentication'
 
     $modInstalado = Get-Module -ListAvailable -Name $moduleName |
                     Sort-Object Version -Descending |
@@ -157,57 +164,62 @@ function Connect-AoSPO {
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# CONEXÃO AO PURVIEW (COMPLIANCE) E LISTAGEM DE LABELS
+# CONEXÃO AO MICROSOFT GRAPH E LISTAGEM DE LABELS
 # ─────────────────────────────────────────────────────────────────────────────
 
-function Connect-AoPurview ([string]$TenantNome) {
-    Write-Section "Conexão ao Purview / Compliance (ExchangeOnlineManagement)"
-    Write-Info 'Conectando via Connect-IPPSSession (MFA habilitado)...'
+function Connect-AoGraph {
+    Write-Section "Conexão ao Microsoft Graph"
+    Write-Info 'Abrindo autenticação moderna no browser (MFA habilitado)...'
 
     try {
-        # UserPrincipalName é opcional; se omitido, o browser pede credenciais
-        Connect-IPPSSession -ShowBanner:$false -ErrorAction Stop
-        Write-Ok 'Conectado ao centro de Conformidade/Purview.'
+        Connect-MgGraph -Scopes 'InformationProtectionPolicy.Read' -NoWelcome -ErrorAction Stop
+        Write-Ok 'Conectado ao Microsoft Graph.'
     }
     catch {
-        Write-Fail "Falha na conexão ao Purview: $_"
+        Write-Fail "Falha na conexão ao Microsoft Graph: $_"
         exit 1
     }
 }
 
 function Get-LabelsDoTenant {
-    Write-Section "Rótulos de Sensibilidade definidos no Tenant (Purview)"
+    Write-Section "Rótulos de Sensibilidade definidos (Microsoft Graph)"
+
+    # Endpoint em /beta (sujeito a mudanças). Em modo delegado só existe consulta
+    # via /me — não há endpoint organizacional disponível para permissões delegadas.
+    $uri = 'https://graph.microsoft.com/beta/me/security/informationProtection/sensitivityLabels'
 
     try {
-        $labels = Get-Label -ErrorAction Stop
+        $resposta = Invoke-MgGraphRequest -Method GET -Uri $uri -ErrorAction Stop
     }
     catch {
-        Write-Warn "Não foi possível listar os rótulos: $_"
+        Write-Warn "Não foi possível listar os rótulos via Graph: $_"
         return @{}
     }
 
-    if ($labels.Count -eq 0) {
-        Write-Warn 'Nenhum rótulo de sensibilidade publicado encontrado no tenant.'
+    $labels = $resposta.value
+
+    if (-not $labels -or $labels.Count -eq 0) {
+        Write-Warn 'Nenhum rótulo de sensibilidade encontrado para o usuário atual.'
         return @{}
     }
 
-    # Monta hashtable GUID(lower) → DisplayName para uso na resolução de sites
+    # Monta hashtable GUID(lower) → Nome para uso na resolução de sites
     $mapa = @{}
 
     Write-Host ''
     Write-Host "  {'Prioridade',-4}  {'Nome',-40}  {'Escopo'}" -ForegroundColor White
     Write-Host "  $('-' * 4)  $('-' * 40)  $('-' * 30)" -ForegroundColor DarkGray
 
-    foreach ($label in ($labels | Sort-Object Priority)) {
-        $guid    = $label.ImmutableId.ToString().ToLower()
-        $nome    = $label.DisplayName
-        $escopo  = $label.ContentType -join ', '
-        $prioridade = $label.Priority
+    foreach ($label in ($labels | Sort-Object sensitivity)) {
+        $guid       = $label.id.ToString().ToLower()
+        $nome       = $label.name
+        $escopo     = ($label.contentFormats -join ', ')
+        $prioridade = $label.sensitivity
 
         $mapa[$guid] = $nome
 
-        $cor = if ($label.IsActive) { 'Green' } else { 'DarkYellow' }
-        $inativo = if (-not $label.IsActive) { '  [inativo]' } else { '' }
+        $cor     = if ($label.isActive) { 'Green' } else { 'DarkYellow' }
+        $inativo = if (-not $label.isActive) { '  [inativo]' } else { '' }
         Write-Host ("  {0,-6}  {1,-40}  {2}{3}" -f $prioridade, $nome, $escopo, $inativo) -ForegroundColor $cor
     }
 
@@ -417,7 +429,7 @@ function Show-Resumo ([System.Collections.Generic.List[PSCustomObject]]$Resultad
 try {
     Write-Banner
     Assert-SPOModule
-    Assert-EXOModule
+    Assert-GraphModule
     Connect-AoSPO | Out-Null
 
     $tenantHabilitado = Test-TenantLabels
@@ -429,7 +441,7 @@ try {
         Write-Host ''
     }
     else {
-        Connect-AoPurview
+        Connect-AoGraph
         $labelsMap = Get-LabelsDoTenant
 
         $resultados = Invoke-SiteLoop -LabelsMap $labelsMap
@@ -440,7 +452,7 @@ finally {
     Write-Host ''
     Write-Host '  Desconectando...' -ForegroundColor Gray
     Disconnect-SPOService -ErrorAction SilentlyContinue
-    Disconnect-ExchangeOnline -Confirm:$false -ErrorAction SilentlyContinue
+    Disconnect-MgGraph -ErrorAction SilentlyContinue | Out-Null
     Write-Host '  Sessão encerrada.' -ForegroundColor Cyan
     Write-Host ''
 }
